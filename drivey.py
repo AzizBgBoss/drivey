@@ -8,9 +8,13 @@ import os, mimetypes, shutil, time
 from flask import (Flask, request, send_file, redirect, url_for,
                    abort, render_template_string)
 from werkzeug.utils import secure_filename
+from auth import init_auth, login_required, login_route, logout_route, set_login_theme
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2 GB
+
+init_auth(app, users_file='drivey_users.json', cookie_name='drivey_token')
+set_login_theme('drivey', 'DRIVE', 'Y', 'personal file drive')
 
 HOME = os.path.expanduser('~/files')
 os.makedirs(HOME, exist_ok=True)
@@ -442,11 +446,13 @@ def render_dir(rel, msg=None, msg_ok=True, sort_by='type', sort_dir='asc',
     )
 
 @app.route('/')
+@login_required
 def index():
     return redirect(url_for('browse', rel=''))
 
 @app.route('/browse/', defaults={'rel': ''})
 @app.route('/browse/<path:rel>')
+@login_required
 def browse(rel):
     sort_by  = request.args.get('sort', 'type')
     sort_dir = request.args.get('dir',  'asc')
@@ -455,6 +461,7 @@ def browse(rel):
     return render_dir(rel, sort_by=sort_by, sort_dir=sort_dir)
 
 @app.route('/search')
+@login_required
 def search():
     q         = request.args.get('q', '').strip()
     base      = request.args.get('base', '')
@@ -467,6 +474,7 @@ def search():
 
 @app.route('/upload/', defaults={'rel': ''}, methods=['GET', 'POST'])
 @app.route('/upload/<path:rel>', methods=['GET', 'POST'])
+@login_required
 def upload(rel):
     if request.method == 'GET':
         return redirect(url_for('browse', rel=rel))
@@ -487,6 +495,7 @@ def upload(rel):
 
 @app.route('/mkdir/', defaults={'rel': ''}, methods=['GET', 'POST'])
 @app.route('/mkdir/<path:rel>', methods=['GET', 'POST'])
+@login_required
 def mkdir(rel):
     if request.method == 'GET':
         return redirect(url_for('browse', rel=rel))
@@ -499,6 +508,7 @@ def mkdir(rel):
     return render_dir(rel, f'created: {name}')
 
 @app.route('/dl/<path:rel>')
+@login_required
 def download(rel):
     abs_path = safe_path(rel)
     if not os.path.isfile(abs_path): abort(404)
@@ -506,6 +516,7 @@ def download(rel):
                      download_name=os.path.basename(abs_path))
 
 @app.route('/open/<path:rel>')
+@login_required
 def open_file(rel):
     abs_path = safe_path(rel)
     if not os.path.isfile(abs_path): abort(404)
@@ -513,6 +524,7 @@ def open_file(rel):
     return send_file(abs_path, mimetype=mime or 'application/octet-stream')
 
 @app.route('/show/<path:rel>')
+@login_required
 def show_file(rel):
     abs_path = safe_path(rel)
     if not os.path.isfile(abs_path): abort(404)
@@ -531,6 +543,7 @@ def show_file(rel):
     )
 
 @app.route('/delete/<path:rel>', methods=['GET', 'POST'])
+@login_required
 def delete(rel):
     abs_path = safe_path(rel)
     if os.path.isdir(abs_path):
@@ -541,6 +554,11 @@ def delete(rel):
         abort(404)
     parent = '/'.join([p for p in rel.split('/') if p][:-1])
     return redirect(url_for('browse', rel=parent))
+
+# ── auth routes ──────────────────────────────────────────────────────────────
+
+app.add_url_rule('/login',  'login',  login_route,  methods=['GET', 'POST'])
+app.add_url_rule('/logout', 'logout', logout_route, methods=['GET', 'POST'])
 
 # ── run ───────────────────────────────────────────────────────────────────────
 
