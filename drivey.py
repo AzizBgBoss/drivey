@@ -333,7 +333,7 @@ input[type=text]:focus { border-color: #00ff88; }
   <div class="clbl">upload to current folder</div>
   <form method="POST" action="/upload/{{ rel_path }}" enctype="multipart/form-data" id="upform">
     <div class="upload-row">
-      <input type="file" name="file" id="fileinput">
+      <input type="file" name="file" multiple id="fileinput">
       <button class="btn" type="submit">UPLOAD</button>
     </div>
   </form>
