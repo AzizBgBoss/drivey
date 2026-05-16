@@ -4,7 +4,7 @@ drivey.py - Simple self-hosted file drive (Flask)
 Home dir: ~/files
 """
 
-import os, mimetypes, shutil
+import os, mimetypes, shutil, time
 from flask import (Flask, request, send_file, redirect, url_for,
                    abort, render_template_string)
 from werkzeug.utils import secure_filename
@@ -22,14 +22,26 @@ SHOW_EXTS = {'.txt', '.md', '.py', '.js', '.ts', '.json', '.html', '.htm',
              '.css', '.sh', '.bash', '.ini', '.cfg', '.conf', '.log',
              '.yaml', '.yml', '.toml', '.xml', '.csv', '.c', '.cpp',
              '.h', '.java', '.rs', '.go', '.rb', '.php', '.sql'}
+DUAL_EXTS = {'.html', '.htm', '.shtml', '.xhtml', '.xhtm', '.xht', '.svg'}
 
-def file_action(name):
+def can_open(name):
     mime, _ = mimetypes.guess_type(name)
+    ext = os.path.splitext(name)[1].lower()
+    if ext in DUAL_EXTS:
+        return True
     if mime:
         for prefix in OPEN_MIME:
             if mime.startswith(prefix):
-                return 'open'
-    if os.path.splitext(name)[1].lower() in SHOW_EXTS:
+                return True
+    return False
+
+def can_show(name):
+    return os.path.splitext(name)[1].lower() in SHOW_EXTS or os.path.splitext(name)[1].lower() in DUAL_EXTS
+
+def file_action(name):
+    if can_open(name):
+        return 'open'
+    if can_show(name):
         return 'show'
     return 'dl'
 
@@ -47,6 +59,22 @@ def fmt_bytes(n):
     if n >= 1 << 10: return f'{n/(1<<10):.1f} KB'
     return f'{n} B'
 
+def fmt_date(ts):
+    return time.strftime('%Y-%m-%d %H:%M', time.localtime(ts))
+
+def fmt_items(n):
+    return f'{n} item' if n == 1 else f'{n} items'
+
+def dir_stats(abs_dir):
+    total = 0
+    count = 0
+    for dp, dnames, fnames in os.walk(abs_dir):
+        count += len(dnames) + len(fnames)
+        for f in fnames:
+            try: total += os.path.getsize(os.path.join(dp, f))
+            except OSError: pass
+    return total, count
+
 def dir_entries(abs_dir, sort_by='type', sort_dir='asc'):
     entries = []
     for name in os.listdir(abs_dir):
@@ -56,13 +84,26 @@ def dir_entries(abs_dir, sort_by='type', sort_dir='asc'):
         except OSError:
             continue
         is_dir = os.path.isdir(full)
+        size = stat.st_size
+        size_fmt = fmt_bytes(size)
+        item_count = None
+        item_count_fmt = ''
+        if is_dir:
+            size, item_count = dir_stats(full)
+            item_count_fmt = fmt_items(item_count)
+            size_fmt = item_count_fmt
         entries.append({
             'name':     name,
             'is_dir':   is_dir,
-            'size':     stat.st_size,
-            'size_fmt': fmt_bytes(stat.st_size) if not is_dir else '---',
+            'size':     size,
+            'size_fmt': size_fmt,
+            'item_count': item_count,
+            'item_count_fmt': item_count_fmt,
             'mtime':    stat.st_mtime,
+            'date_fmt': fmt_date(stat.st_mtime),
             'action':   'dir' if is_dir else file_action(name),
+            'can_open': False if is_dir else can_open(name),
+            'can_show': False if is_dir else can_show(name),
         })
     rev = (sort_dir == 'desc')
     if sort_by == 'name':
@@ -79,11 +120,7 @@ def dir_entries(abs_dir, sort_by='type', sort_dir='asc'):
     return entries
 
 def dir_size(abs_dir):
-    total = 0
-    for dp, _, fnames in os.walk(abs_dir):
-        for f in fnames:
-            try: total += os.path.getsize(os.path.join(dp, f))
-            except: pass
+    total, _ = dir_stats(abs_dir)
     return total
 
 def search_files(query, rel_base, recursive):
@@ -101,7 +138,10 @@ def search_files(query, rel_base, recursive):
                         stat = os.stat(full)
                         results.append({'name': name, 'rel': rel,
                                         'size_fmt': fmt_bytes(stat.st_size),
-                                        'action': file_action(name)})
+                                        'date_fmt': fmt_date(stat.st_mtime),
+                                        'action': file_action(name),
+                                        'can_open': can_open(name),
+                                        'can_show': can_show(name)})
                     except OSError:
                         pass
     else:
@@ -114,7 +154,10 @@ def search_files(query, rel_base, recursive):
                         rel  = os.path.relpath(full, HOME)
                         results.append({'name': name, 'rel': rel,
                                         'size_fmt': fmt_bytes(stat.st_size),
-                                        'action': file_action(name)})
+                                        'date_fmt': fmt_date(stat.st_mtime),
+                                        'action': file_action(name),
+                                        'can_open': can_open(name),
+                                        'can_show': can_show(name)})
                     except OSError:
                         pass
     results.sort(key=lambda r: r['name'].lower())
@@ -148,26 +191,29 @@ h1 span { color: #ff6b35; }
 .search-row input[type=text]:focus { border-color: #00ff88; }
 .rec-wrap { margin-top: 8px; font-size: 11px; color: #4a5a4a; text-transform: uppercase; }
 .rec-wrap input { margin-right: 5px; }
-.sortbar { max-width: 640px; margin: 0 auto; display: -webkit-box; display: -webkit-flex; display: flex; border: 1px solid #1a1a2e; border-bottom: none; }
-.sbtn { -webkit-box-flex: 1; -webkit-flex: 1; flex: 1; background: transparent; border: none; border-right: 1px solid #1a1a2e; color: #4a5a4a; font-family: monospace; font-size: 11px; padding: 6px 4px; cursor: pointer; text-transform: uppercase; text-align: center; }
+.sortbar { max-width: 640px; width: 100%; margin: 0 auto; display: table; table-layout: fixed; border: 1px solid #1a1a2e; border-bottom: none; }
+.sbtn { display: table-cell; width: 25%; background: transparent; border: none; border-right: 1px solid #1a1a2e; color: #4a5a4a; font-family: monospace; font-size: 11px; padding: 6px 4px; cursor: pointer; text-transform: uppercase; text-align: center; }
 .sbtn:last-child { border-right: none; }
 .sbtn.on { color: #00ff88; }
-.upload-row { display: -webkit-box; display: -webkit-flex; display: flex; gap: 8px; -webkit-box-align: center; -webkit-align-items: center; align-items: center; }
+.upload-row { display: -webkit-box; display: -webkit-flex; display: flex; -webkit-box-align: center; -webkit-align-items: center; align-items: center; }
 input[type=file] { -webkit-box-flex: 1; -webkit-flex: 1; flex: 1; background: #0a0a0f; border: 1px solid #1a1a2e; color: #c8d8c8; font-family: monospace; font-size: 12px; padding: 7px 8px; }
+.upload-row .btn { margin-left: 8px; }
 .mkdir-row { display: -webkit-box; display: -webkit-flex; display: flex; margin-top: 10px; }
 input[type=text] { -webkit-box-flex: 1; -webkit-flex: 1; flex: 1; background: #0a0a0f; border: 1px solid #1a1a2e; border-right: none; color: #c8d8c8; font-family: monospace; font-size: 13px; padding: 7px 10px; outline: none; }
 input[type=text]:focus { border-color: #00ff88; }
 .btn { background: transparent; border: 1px solid #00ff88; color: #00ff88; font-family: monospace; font-size: 12px; padding: 7px 14px; cursor: pointer; text-transform: uppercase; white-space: nowrap; }
 .shdr { max-width: 640px; margin: 0 auto; font-size: 11px; color: #4a5a4a; letter-spacing: 3px; text-transform: uppercase; border-bottom: 1px solid #1a1a2e; padding-bottom: 5px; }
-.row { background: #0f0f1a; border: 1px solid #1a1a2e; border-top: none; max-width: 640px; margin: 0 auto; padding: 9px 12px; display: -webkit-box; display: -webkit-flex; display: flex; -webkit-box-align: center; -webkit-align-items: center; align-items: center; gap: 8px; }
+.row { background: #0f0f1a; border: 1px solid #1a1a2e; border-top: none; max-width: 640px; width: 100%; margin: 0 auto; padding: 0; display: table; table-layout: fixed; }
 .row:first-child { border-top: 1px solid #1a1a2e; }
-.icon { font-size: 14px; width: 18px; -webkit-flex-shrink: 0; flex-shrink: 0; }
-.fname { -webkit-box-flex: 1; -webkit-flex: 1; flex: 1; font-size: 13px; word-break: break-all; }
+.icon { display: table-cell; vertical-align: middle; font-size: 14px; width: 24px; padding: 9px 0 9px 8px; }
+.fname { display: table-cell; vertical-align: middle; font-size: 13px; word-break: break-all; padding: 9px 6px; }
 .fname a:hover { color: #00ff88; }
 .fpath { font-size: 10px; color: #4a5a4a; display: block; margin-top: 2px; }
-.fsize { font-size: 11px; color: #4a5a4a; -webkit-flex-shrink: 0; flex-shrink: 0; min-width: 60px; text-align: right; }
-.acts { display: -webkit-box; display: -webkit-flex; display: flex; gap: 4px; -webkit-flex-shrink: 0; flex-shrink: 0; -webkit-flex-wrap: wrap; flex-wrap: wrap; }
-.acts a, .acts button { font-size: 11px; color: #00ff88; border: 1px solid #1a1a2e; padding: 3px 6px; background: transparent; font-family: monospace; cursor: pointer; text-transform: uppercase; white-space: nowrap; }
+.fdate { display: table-cell; vertical-align: middle; font-size: 10px; color: #4a5a4a; width: 92px; padding: 9px 4px; text-align: right; }
+.fsize { display: table-cell; vertical-align: middle; font-size: 11px; color: #4a5a4a; width: 74px; padding: 9px 4px; text-align: right; }
+.itemcount { display: block; font-size: 10px; color: #4a5a4a; margin-top: 2px; }
+.acts { display: table-cell; vertical-align: middle; width: 88px; padding: 6px 8px 6px 4px; text-align: right; }
+.acts a, .acts button { display: inline-block; font-size: 11px; color: #00ff88; border: 1px solid #1a1a2e; padding: 3px 5px; margin: 1px 0 1px 2px; background: transparent; font-family: monospace; cursor: pointer; text-transform: uppercase; white-space: nowrap; }
 .acts a.show { color: #ffe066; }
 .acts button.del { color: #ff6b35; }
 .empty { max-width: 640px; margin: 0 auto; background: #0f0f1a; border: 1px solid #1a1a2e; padding: 20px; text-align: center; font-size: 12px; color: #4a5a4a; }
@@ -216,10 +262,11 @@ input[type=text]:focus { border-color: #00ff88; }
       <a href="/{{ r.action }}/{{ r.rel }}">{{ r.name }}</a>
       <span class="fpath">{{ r.rel }}</span>
     </span>
+    <span class="fdate">{{ r.date_fmt }}</span>
     <span class="fsize">{{ r.size_fmt }}</span>
     <span class="acts">
-      {% if r.action == 'open' %}<a href="/open/{{ r.rel }}">OPEN</a>
-      {% elif r.action == 'show' %}<a class="show" href="/show/{{ r.rel }}">SHOW</a>{% endif %}
+      {% if r.can_open %}<a href="/open/{{ r.rel }}">OPEN</a>{% endif %}
+      {% if r.can_show %}<a class="show" href="/show/{{ r.rel }}">SHOW</a>{% endif %}
       <a href="/dl/{{ r.rel }}">DL</a>
       <button class="del" onclick="delItem('{{ r.rel | urlencode }}', this)">X</button>
     </span>
@@ -232,15 +279,16 @@ input[type=text]:focus { border-color: #00ff88; }
 {% else %}
 <div class="sortbar">
   {% for key, label in [('type','TYPE'),('name','NAME'),('size','SIZE'),('date','DATE')] %}
-  <button class="sbtn {% if sort_by == key %}on{% endif %}" onclick="setSort('{{ key }}')">{{ label }}{% if sort_by == key %} {{ '&darr;' if sort_dir == 'desc' else '&uarr;' }}{% endif %}</button>
+  <button class="sbtn {% if sort_by == key %}on{% endif %}" onclick="setSort('{{ key }}')">{{ label }}{% if sort_by == key %} {{ 'v' if sort_dir == 'desc' else '^' }}{% endif %}</button>
   {% endfor %}
 </div>
-<div class="shdr">name</div>
+<div class="shdr">name / date / size</div>
 
 {% if rel_path %}
 <div class="row">
   <span class="icon">&#128193;</span>
   <span class="fname"><a href="/browse/{{ parent_path }}">..</a></span>
+  <span class="fdate">---</span>
   <span class="fsize">---</span>
   <span class="acts"></span>
 </div>
@@ -262,11 +310,14 @@ input[type=text]:focus { border-color: #00ff88; }
         <a href="/dl/{{ fpath }}">{{ e.name }}</a>
       {% endif %}
     </span>
-    <span class="fsize">{{ e.size_fmt }}</span>
+    <span class="fdate">{{ e.date_fmt }}</span>
+    <span class="fsize">
+      {{ e.size_fmt }}
+    </span>
     <span class="acts">
       {% if not e.is_dir %}
-        {% if e.action == 'open' %}<a href="/open/{{ fpath }}">OPEN</a>
-        {% elif e.action == 'show' %}<a class="show" href="/show/{{ fpath }}">SHOW</a>{% endif %}
+        {% if e.can_open %}<a href="/open/{{ fpath }}">OPEN</a>{% endif %}
+        {% if e.can_show %}<a class="show" href="/show/{{ fpath }}">SHOW</a>{% endif %}
         <a href="/dl/{{ fpath }}">DL</a>
       {% endif %}
       <button class="del" onclick="delItem('{{ fpath | urlencode }}', this)">X</button>
