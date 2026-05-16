@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-drive.py - Simple self-hosted file drive (Flask)
+drivey.py - Simple self-hosted file drive (Flask)
 Home dir: ~/files
 """
 
-import os, math, mimetypes
+import os, mimetypes, shutil
 from flask import (Flask, request, send_file, redirect, url_for,
-                   abort, render_template_string, jsonify)
+                   abort, render_template_string)
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
@@ -15,10 +15,27 @@ app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2 GB
 HOME = os.path.expanduser('~/files')
 os.makedirs(HOME, exist_ok=True)
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── MIME classification ───────────────────────────────────────────────────────
+
+OPEN_MIME = ('audio/', 'video/', 'image/', 'application/pdf')
+SHOW_EXTS = {'.txt', '.md', '.py', '.js', '.ts', '.json', '.html', '.htm',
+             '.css', '.sh', '.bash', '.ini', '.cfg', '.conf', '.log',
+             '.yaml', '.yml', '.toml', '.xml', '.csv', '.c', '.cpp',
+             '.h', '.java', '.rs', '.go', '.rb', '.php', '.sql'}
+
+def file_action(name):
+    mime, _ = mimetypes.guess_type(name)
+    if mime:
+        for prefix in OPEN_MIME:
+            if mime.startswith(prefix):
+                return 'open'
+    if os.path.splitext(name)[1].lower() in SHOW_EXTS:
+        return 'show'
+    return 'dl'
+
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def safe_path(rel):
-    """Resolve rel path inside HOME; abort 400 if escaping."""
     target = os.path.realpath(os.path.join(HOME, rel))
     if not target.startswith(os.path.realpath(HOME)):
         abort(400)
@@ -30,19 +47,35 @@ def fmt_bytes(n):
     if n >= 1 << 10: return f'{n/(1<<10):.1f} KB'
     return f'{n} B'
 
-def dir_entries(abs_dir):
+def dir_entries(abs_dir, sort_by='type', sort_dir='asc'):
     entries = []
-    for name in sorted(os.listdir(abs_dir)):
+    for name in os.listdir(abs_dir):
         full = os.path.join(abs_dir, name)
-        stat = os.stat(full)
+        try:
+            stat = os.stat(full)
+        except OSError:
+            continue
+        is_dir = os.path.isdir(full)
         entries.append({
-            'name': name,
-            'is_dir': os.path.isdir(full),
-            'size': stat.st_size,
-            'size_fmt': fmt_bytes(stat.st_size) if not os.path.isdir(full) else '—',
-            'mtime': stat.st_mtime,
+            'name':     name,
+            'is_dir':   is_dir,
+            'size':     stat.st_size,
+            'size_fmt': fmt_bytes(stat.st_size) if not is_dir else '---',
+            'mtime':    stat.st_mtime,
+            'action':   'dir' if is_dir else file_action(name),
         })
-    entries.sort(key=lambda e: (not e['is_dir'], e['name'].lower()))
+    rev = (sort_dir == 'desc')
+    if sort_by == 'name':
+        entries.sort(key=lambda e: e['name'].lower(), reverse=rev)
+    elif sort_by == 'size':
+        entries.sort(key=lambda e: e['size'], reverse=rev)
+    elif sort_by == 'date':
+        entries.sort(key=lambda e: e['mtime'], reverse=rev)
+    else:  # type
+        if rev:
+            entries.sort(key=lambda e: (e['is_dir'], e['name'].lower()))
+        else:
+            entries.sort(key=lambda e: (not e['is_dir'], e['name'].lower()))
     return entries
 
 def dir_size(abs_dir):
@@ -53,118 +86,204 @@ def dir_size(abs_dir):
             except: pass
     return total
 
-# ── HTML template ─────────────────────────────────────────────────────────────
+def search_files(query, rel_base, recursive):
+    q = query.lower()
+    results = []
+    abs_base = safe_path(rel_base)
+    if recursive:
+        for dp, dirs, files in os.walk(abs_base):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            for name in files:
+                if q in name.lower():
+                    full = os.path.join(dp, name)
+                    rel  = os.path.relpath(full, HOME)
+                    try:
+                        stat = os.stat(full)
+                        results.append({'name': name, 'rel': rel,
+                                        'size_fmt': fmt_bytes(stat.st_size),
+                                        'action': file_action(name)})
+                    except OSError:
+                        pass
+    else:
+        for name in os.listdir(abs_base):
+            if q in name.lower():
+                full = os.path.join(abs_base, name)
+                if os.path.isfile(full):
+                    try:
+                        stat = os.stat(full)
+                        rel  = os.path.relpath(full, HOME)
+                        results.append({'name': name, 'rel': rel,
+                                        'size_fmt': fmt_bytes(stat.st_size),
+                                        'action': file_action(name)})
+                    except OSError:
+                        pass
+    results.sort(key=lambda r: r['name'].lower())
+    return results
 
-TEMPLATE = r"""<!DOCTYPE html>
+
+# ── templates ─────────────────────────────────────────────────────────────────
+
+TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>drive / {{ breadcrumb_str }}</title>
+<title>drivey / {{ breadcrumb_str }}</title>
 <style>
 * { -webkit-box-sizing: border-box; box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  background: #0a0a0f;
-  color: #c8d8c8;
-  font-family: monospace;
-  font-size: 14px;
-  padding: 20px 10px 60px;
-}
+body { background: #0a0a0f; color: #c8d8c8; font-family: monospace; font-size: 14px; padding: 20px 10px 60px; }
 a { color: inherit; text-decoration: none; }
-
-/* header */
-.header { max-width: 640px; margin: 0 auto 6px; display: -webkit-box; display: -webkit-flex; display: flex; -webkit-box-align: center; -webkit-align-items: center; align-items: center; -webkit-box-pack: justify; -webkit-justify-content: space-between; justify-content: space-between; }
-h1 { font-size: 1.6rem; color: #00ff88; letter-spacing: 0; }
+.header { max-width: 640px; margin: 0 auto 6px; }
+h1 { font-size: 1.6rem; color: #00ff88; }
 h1 span { color: #ff6b35; }
 .sub { font-size: 11px; color: #4a5a4a; letter-spacing: 3px; text-transform: uppercase; max-width: 640px; margin: 0 auto 18px; }
-
-/* breadcrumb */
 .breadcrumb { max-width: 640px; margin: 0 auto 10px; font-size: 12px; color: #4a5a4a; text-transform: uppercase; letter-spacing: 1px; }
 .breadcrumb a { color: #00ff88; }
 .breadcrumb span { color: #4a5a4a; margin: 0 4px; }
-
-/* storage bar */
-.storageline { max-width: 640px; margin: 0 auto 14px; display: -webkit-box; display: -webkit-flex; display: flex; -webkit-box-pack: justify; -webkit-justify-content: space-between; justify-content: space-between; font-size: 11px; color: #4a5a4a; text-transform: uppercase; letter-spacing: 1px; }
-
-/* upload card */
-.card { background: #0f0f1a; border: 1px solid #1a1a2e; max-width: 640px; margin: 0 auto 18px; padding: 14px; }
+.storageline { max-width: 640px; margin: 0 auto 14px; display: -webkit-box; display: -webkit-flex; display: flex; -webkit-box-pack: justify; -webkit-justify-content: space-between; justify-content: space-between; font-size: 11px; color: #4a5a4a; text-transform: uppercase; }
+.card { background: #0f0f1a; border: 1px solid #1a1a2e; max-width: 640px; margin: 0 auto 12px; padding: 14px; }
 .clbl { font-size: 11px; color: #4a5a4a; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 8px; }
-.upload-row { display: -webkit-box; display: -webkit-flex; display: flex; -webkit-box-align: center; -webkit-align-items: center; align-items: center; gap: 8px; }
+.search-row { display: -webkit-box; display: -webkit-flex; display: flex; }
+.search-row input[type=text] { -webkit-box-flex: 1; -webkit-flex: 1; flex: 1; background: #0a0a0f; border: 1px solid #1a1a2e; border-right: none; color: #c8d8c8; font-family: monospace; font-size: 13px; padding: 7px 10px; outline: none; }
+.search-row input[type=text]:focus { border-color: #00ff88; }
+.rec-wrap { margin-top: 8px; font-size: 11px; color: #4a5a4a; text-transform: uppercase; }
+.rec-wrap input { margin-right: 5px; }
+.sortbar { max-width: 640px; margin: 0 auto; display: -webkit-box; display: -webkit-flex; display: flex; border: 1px solid #1a1a2e; border-bottom: none; }
+.sbtn { -webkit-box-flex: 1; -webkit-flex: 1; flex: 1; background: transparent; border: none; border-right: 1px solid #1a1a2e; color: #4a5a4a; font-family: monospace; font-size: 11px; padding: 6px 4px; cursor: pointer; text-transform: uppercase; text-align: center; }
+.sbtn:last-child { border-right: none; }
+.sbtn.on { color: #00ff88; }
+.upload-row { display: -webkit-box; display: -webkit-flex; display: flex; gap: 8px; -webkit-box-align: center; -webkit-align-items: center; align-items: center; }
 input[type=file] { -webkit-box-flex: 1; -webkit-flex: 1; flex: 1; background: #0a0a0f; border: 1px solid #1a1a2e; color: #c8d8c8; font-family: monospace; font-size: 12px; padding: 7px 8px; }
-.btn { background: transparent; border: 1px solid #00ff88; color: #00ff88; font-family: monospace; font-size: 12px; padding: 7px 14px; cursor: pointer; text-transform: uppercase; white-space: nowrap; }
-.btn:disabled { opacity: 0.4; cursor: default; }
-.btn.warn { border-color: #ff6b35; color: #ff6b35; }
-.btn.muted { border-color: #1a1a2e; color: #4a5a4a; }
 .mkdir-row { display: -webkit-box; display: -webkit-flex; display: flex; margin-top: 10px; }
 input[type=text] { -webkit-box-flex: 1; -webkit-flex: 1; flex: 1; background: #0a0a0f; border: 1px solid #1a1a2e; border-right: none; color: #c8d8c8; font-family: monospace; font-size: 13px; padding: 7px 10px; outline: none; }
 input[type=text]:focus { border-color: #00ff88; }
-
-/* file list */
-.shdr { max-width: 640px; margin: 0 auto; font-size: 11px; color: #4a5a4a; letter-spacing: 3px; text-transform: uppercase; border-bottom: 1px solid #1a1a2e; padding-bottom: 5px; margin-bottom: 0; }
-.row {
-  background: #0f0f1a;
-  border: 1px solid #1a1a2e;
-  border-top: none;
-  max-width: 640px;
-  margin: 0 auto;
-  padding: 9px 12px;
-  display: -webkit-box; display: -webkit-flex; display: flex;
-  -webkit-box-align: center; -webkit-align-items: center; align-items: center;
-  gap: 8px;
-}
+.btn { background: transparent; border: 1px solid #00ff88; color: #00ff88; font-family: monospace; font-size: 12px; padding: 7px 14px; cursor: pointer; text-transform: uppercase; white-space: nowrap; }
+.shdr { max-width: 640px; margin: 0 auto; font-size: 11px; color: #4a5a4a; letter-spacing: 3px; text-transform: uppercase; border-bottom: 1px solid #1a1a2e; padding-bottom: 5px; }
+.row { background: #0f0f1a; border: 1px solid #1a1a2e; border-top: none; max-width: 640px; margin: 0 auto; padding: 9px 12px; display: -webkit-box; display: -webkit-flex; display: flex; -webkit-box-align: center; -webkit-align-items: center; align-items: center; gap: 8px; }
 .row:first-child { border-top: 1px solid #1a1a2e; }
 .icon { font-size: 14px; width: 18px; -webkit-flex-shrink: 0; flex-shrink: 0; }
 .fname { -webkit-box-flex: 1; -webkit-flex: 1; flex: 1; font-size: 13px; word-break: break-all; }
 .fname a:hover { color: #00ff88; }
+.fpath { font-size: 10px; color: #4a5a4a; display: block; margin-top: 2px; }
 .fsize { font-size: 11px; color: #4a5a4a; -webkit-flex-shrink: 0; flex-shrink: 0; min-width: 60px; text-align: right; }
-.acts { display: -webkit-box; display: -webkit-flex; display: flex; gap: 6px; -webkit-flex-shrink: 0; flex-shrink: 0; }
-.acts a, .acts button { font-size: 11px; color: #00ff88; border: 1px solid #1a1a2e; padding: 3px 7px; background: transparent; font-family: monospace; cursor: pointer; text-transform: uppercase; white-space: nowrap; }
+.acts { display: -webkit-box; display: -webkit-flex; display: flex; gap: 4px; -webkit-flex-shrink: 0; flex-shrink: 0; -webkit-flex-wrap: wrap; flex-wrap: wrap; }
+.acts a, .acts button { font-size: 11px; color: #00ff88; border: 1px solid #1a1a2e; padding: 3px 6px; background: transparent; font-family: monospace; cursor: pointer; text-transform: uppercase; white-space: nowrap; }
+.acts a.show { color: #ffe066; }
 .acts button.del { color: #ff6b35; }
 .empty { max-width: 640px; margin: 0 auto; background: #0f0f1a; border: 1px solid #1a1a2e; padding: 20px; text-align: center; font-size: 12px; color: #4a5a4a; }
-
-/* flash */
 .flash { max-width: 640px; margin: 0 auto 12px; padding: 8px 12px; font-size: 12px; border: 1px solid; }
 .flash.ok  { border-color: #00ff88; color: #00ff88; }
 .flash.err { border-color: #ff6b35; color: #ff6b35; }
-
-/* progress overlay */
 #prog { display: none; position: fixed; bottom: 0; left: 0; right: 0; background: #0f0f1a; border-top: 1px solid #1a1a2e; padding: 10px 20px; font-size: 12px; color: #00ff88; text-transform: uppercase; }
 #pbar { height: 3px; background: #1a1a2e; margin-top: 6px; }
 #pfill { height: 100%; width: 0; background: #00ff88; }
 </style>
 </head>
 <body>
-
-<div class="header">
-  <h1>DRIVE<span>Y</span></h1>
-</div>
+<div class="header"><h1>DRIVE<span>Y</span></h1></div>
 <div class="sub">personal file drive</div>
 
-{% if msg %}
-<div class="flash {{ 'ok' if msg_ok else 'err' }}">{{ msg }}</div>
-{% endif %}
+{% if msg %}<div class="flash {{ 'ok' if msg_ok else 'err' }}">{{ msg }}</div>{% endif %}
 
-<!-- breadcrumb -->
 <div class="breadcrumb">
   <a href="/">~</a>
-  {% for crumb in crumbs %}
-    <span>/</span><a href="/browse/{{ crumb.path }}">{{ crumb.name }}</a>
+  {% for crumb in crumbs %}<span>/</span><a href="/browse/{{ crumb.path }}">{{ crumb.name }}</a>{% endfor %}
+</div>
+<div class="storageline"><span>{{ entry_count }} items</span><span>{{ total_size }}</span></div>
+
+<div class="card">
+  <div class="clbl">search</div>
+  <form method="GET" action="/search" id="sform">
+    <input type="hidden" name="base" value="{{ rel_path }}">
+    <div class="search-row">
+      <input type="text" name="q" id="sq" placeholder="filename..." value="{{ search_q }}" autocomplete="off">
+      <button class="btn" type="submit">FIND</button>
+    </div>
+    <div class="rec-wrap">
+      <input type="checkbox" name="r" id="rec" value="1" {{ 'checked' if search_recursive }}>
+      <label for="rec">recursive</label>
+    </div>
+  </form>
+</div>
+
+{% if search_results is not none %}
+<div class="shdr">results for "{{ search_q }}"{% if search_recursive %} (recursive){% endif %}</div>
+{% if search_results %}
+  {% for r in search_results %}
+  <div class="row">
+    <span class="icon">&#128196;</span>
+    <span class="fname">
+      <a href="/{{ r.action }}/{{ r.rel }}">{{ r.name }}</a>
+      <span class="fpath">{{ r.rel }}</span>
+    </span>
+    <span class="fsize">{{ r.size_fmt }}</span>
+    <span class="acts">
+      {% if r.action == 'open' %}<a href="/open/{{ r.rel }}">OPEN</a>
+      {% elif r.action == 'show' %}<a class="show" href="/show/{{ r.rel }}">SHOW</a>{% endif %}
+      <a href="/dl/{{ r.rel }}">DL</a>
+      <button class="del" onclick="delItem('{{ r.rel | urlencode }}', this)">X</button>
+    </span>
+  </div>
+  {% endfor %}
+{% else %}
+  <div class="empty">no results</div>
+{% endif %}
+
+{% else %}
+<div class="sortbar">
+  {% for key, label in [('type','TYPE'),('name','NAME'),('size','SIZE'),('date','DATE')] %}
+  <button class="sbtn {% if sort_by == key %}on{% endif %}" onclick="setSort('{{ key }}')">{{ label }}{% if sort_by == key %} {{ '&darr;' if sort_dir == 'desc' else '&uarr;' }}{% endif %}</button>
   {% endfor %}
 </div>
+<div class="shdr">name</div>
 
-<!-- storage info -->
-<div class="storageline">
-  <span>{{ entry_count }} items</span>
-  <span>{{ total_size }}</span>
+{% if rel_path %}
+<div class="row">
+  <span class="icon">&#128193;</span>
+  <span class="fname"><a href="/browse/{{ parent_path }}">..</a></span>
+  <span class="fsize">---</span>
+  <span class="acts"></span>
 </div>
+{% endif %}
 
-<!-- upload + mkdir -->
-<div class="card">
+{% if entries %}
+  {% for e in entries %}
+  {% set fpath = (rel_path + '/' + e.name).strip('/') %}
+  <div class="row">
+    <span class="icon">{% if e.is_dir %}&#128193;{% else %}&#128196;{% endif %}</span>
+    <span class="fname">
+      {% if e.is_dir %}
+        <a href="/browse/{{ fpath }}?sort={{ sort_by }}&dir={{ sort_dir }}">{{ e.name }}/</a>
+      {% elif e.action == 'open' %}
+        <a href="/open/{{ fpath }}">{{ e.name }}</a>
+      {% elif e.action == 'show' %}
+        <a href="/show/{{ fpath }}">{{ e.name }}</a>
+      {% else %}
+        <a href="/dl/{{ fpath }}">{{ e.name }}</a>
+      {% endif %}
+    </span>
+    <span class="fsize">{{ e.size_fmt }}</span>
+    <span class="acts">
+      {% if not e.is_dir %}
+        {% if e.action == 'open' %}<a href="/open/{{ fpath }}">OPEN</a>
+        {% elif e.action == 'show' %}<a class="show" href="/show/{{ fpath }}">SHOW</a>{% endif %}
+        <a href="/dl/{{ fpath }}">DL</a>
+      {% endif %}
+      <button class="del" onclick="delItem('{{ fpath | urlencode }}', this)">X</button>
+    </span>
+  </div>
+  {% endfor %}
+{% else %}
+  <div class="empty">folder is empty</div>
+{% endif %}
+{% endif %}
+
+<div class="card" style="margin-top:18px;">
   <div class="clbl">upload to current folder</div>
   <form method="POST" action="/upload/{{ rel_path }}" enctype="multipart/form-data" id="upform">
     <div class="upload-row">
-      <input type="file" name="file" multiple id="fileinput">
-      <button class="btn" type="submit" id="upbtn">UPLOAD</button>
+      <input type="file" name="file" id="fileinput">
+      <button class="btn" type="submit">UPLOAD</button>
     </div>
   </form>
   <form method="POST" action="/mkdir/{{ rel_path }}" id="mkform" style="margin-top:10px;">
@@ -175,112 +294,100 @@ input[type=text]:focus { border-color: #00ff88; }
   </form>
 </div>
 
-<!-- file list -->
-<div class="shdr">name</div>
-
-{% if rel_path %}
-<div class="row">
-  <span class="icon">&#128193;</span>
-  <span class="fname"><a href="/browse/{{ parent_path }}">..</a></span>
-  <span class="fsize">—</span>
-  <span class="acts"></span>
-</div>
-{% endif %}
-
-{% if entries %}
-  {% for e in entries %}
-  <div class="row">
-    <span class="icon">{% if e.is_dir %}&#128193;{% else %}&#128196;{% endif %}</span>
-    <span class="fname">
-      {% if e.is_dir %}
-        <a href="/browse/{{ (rel_path + '/' + e.name).strip('/') }}">{{ e.name }}/</a>
-      {% else %}
-        <a href="/open/{{ (rel_path + '/' + e.name).strip('/') }}">{{ e.name }}</a>
-      {% endif %}
-    </span>
-    <span class="fsize">{{ e.size_fmt }}</span>
-    <span class="acts">
-      {% if not e.is_dir %}
-        <a href="/dl/{{ (rel_path + '/' + e.name).strip('/') }}">DL</a>
-      {% endif %}
-      <button class="del" onclick="delItem('{{ (rel_path + '/' + e.name).strip('/') | urlencode }}', this)">X</button>
-    </span>
-  </div>
-  {% endfor %}
-{% else %}
-  <div class="empty">folder is empty</div>
-{% endif %}
-
 <div id="prog"><span id="pstat">uploading...</span><div id="pbar"><div id="pfill"></div></div></div>
 
 <script>
-/* Native multipart POST — no XHR/FormData.
-   BB OS 6 WebKit bug: FormData silently drops file inputs even when a file
-   is selected, so the upload body arrives empty. Plain native POST works. */
+function setSort(key) {
+  var cur = '{{ sort_by }}', dir = '{{ sort_dir }}';
+  var nd = (key === cur && dir === 'asc') ? 'desc' : 'asc';
+  window.location = '/browse/{{ rel_path }}?sort=' + key + '&dir=' + nd;
+}
 document.getElementById('upform').onsubmit = function() {
   var f = document.getElementById('fileinput');
   if (!f || !f.value) { return false; }
-  var prog = document.getElementById('prog');
-  if (prog) { prog.style.display = 'block'; }
+  var p = document.getElementById('prog');
+  if (p) { p.style.display = 'block'; }
   return true;
 };
-
-/* confirm-delete pattern */
 var pendingDel = '', pendingTimer = null;
 function delItem(path, btn) {
   if (pendingDel !== path) {
-    pendingDel = path;
-    btn.innerHTML = 'sure?';
+    pendingDel = path; btn.innerHTML = 'sure?';
     if (pendingTimer) { clearTimeout(pendingTimer); }
     pendingTimer = setTimeout(function() { pendingDel = ''; window.location.reload(); }, 3000);
     return;
   }
-  var xhr2 = new XMLHttpRequest();
-  xhr2.onload = function() { window.location.reload(); };
-  xhr2.open('POST', '/delete/' + path);
-  xhr2.send();
+  if (typeof XMLHttpRequest !== 'undefined') {
+    var x = new XMLHttpRequest();
+    x.onload = function() { window.location.reload(); };
+    x.open('POST', '/delete/' + path); x.send();
+  } else { window.location = '/delete/' + path; }
 }
-
-/* mkdir enter key */
-document.getElementById('dname').onkeydown = function(e) {
-  if ((e || window.event).keyCode === 13) { document.getElementById('mkform').submit(); }
-};
+var dn = document.getElementById('dname');
+if (dn) { dn.onkeydown = function(e) { if ((e||window.event).keyCode===13) document.getElementById('mkform').submit(); }; }
+var sq = document.getElementById('sq');
+if (sq) { sq.onkeydown = function(e) { if ((e||window.event).keyCode===13) document.getElementById('sform').submit(); }; }
 </script>
 </body>
 </html>
 """
 
+SHOW_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ name }}</title>
+<style>
+* { -webkit-box-sizing: border-box; box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #0a0a0f; color: #c8d8c8; font-family: monospace; font-size: 14px; padding: 20px 10px 60px; }
+a { color: #00ff88; text-decoration: none; }
+h1 { font-size: 1.6rem; color: #00ff88; margin-bottom: 16px; }
+h1 span { color: #ff6b35; }
+.viewer { max-width: 640px; margin: 0 auto; background: #0f0f1a; border: 1px solid #1a1a2e; padding: 14px; }
+.viewer-hdr { display: -webkit-box; display: -webkit-flex; display: flex; -webkit-box-pack: justify; -webkit-justify-content: space-between; justify-content: space-between; margin-bottom: 10px; font-size: 11px; color: #4a5a4a; text-transform: uppercase; }
+pre { font-size: 12px; white-space: pre-wrap; word-break: break-all; color: #c8d8c8; line-height: 1.5; }
+</style>
+</head>
+<body>
+<h1>DRIVE<span>Y</span></h1>
+<div class="viewer">
+  <div class="viewer-hdr">
+    <span>{{ name }}</span>
+    <span><a href="/dl/{{ rel }}">DL</a> &nbsp; <a href="/browse/{{ parent }}">BACK</a></span>
+  </div>
+  <pre>{{ content }}</pre>
+</div>
+</body>
+</html>
+"""
+
+
 # ── routes ────────────────────────────────────────────────────────────────────
 
-def render_dir(rel, msg=None, msg_ok=True):
+def render_dir(rel, msg=None, msg_ok=True, sort_by='type', sort_dir='asc',
+               search_q='', search_results=None, search_recursive=False):
     abs_dir = safe_path(rel)
     if not os.path.isdir(abs_dir):
         abort(404)
-
-    entries = dir_entries(abs_dir)
+    entries = dir_entries(abs_dir, sort_by, sort_dir)
     total   = dir_size(abs_dir)
-
-    # breadcrumb parts
-    parts = [p for p in rel.split('/') if p]
-    crumbs = []
-    for i, part in enumerate(parts):
-        crumbs.append({'name': part, 'path': '/'.join(parts[:i+1])})
-
-    parent_parts = parts[:-1]
-    parent_path  = '/'.join(parent_parts)
-    breadcrumb_str = '/' + rel if rel else '~'
-
+    parts   = [p for p in rel.split('/') if p]
+    crumbs  = [{'name': p, 'path': '/'.join(parts[:i+1])} for i, p in enumerate(parts)]
     return render_template_string(
         TEMPLATE,
         rel_path=rel,
         entries=entries,
         crumbs=crumbs,
-        parent_path=parent_path,
-        breadcrumb_str=breadcrumb_str,
+        parent_path='/'.join(parts[:-1]),
+        breadcrumb_str='/' + rel if rel else '~',
         entry_count=len(entries),
         total_size=fmt_bytes(total),
-        msg=msg,
-        msg_ok=msg_ok,
+        msg=msg, msg_ok=msg_ok,
+        sort_by=sort_by, sort_dir=sort_dir,
+        search_q=search_q,
+        search_results=search_results,
+        search_recursive=search_recursive,
     )
 
 @app.route('/')
@@ -290,11 +397,28 @@ def index():
 @app.route('/browse/', defaults={'rel': ''})
 @app.route('/browse/<path:rel>')
 def browse(rel):
-    return render_dir(rel)
+    sort_by  = request.args.get('sort', 'type')
+    sort_dir = request.args.get('dir',  'asc')
+    if sort_by  not in ('type','name','size','date'): sort_by  = 'type'
+    if sort_dir not in ('asc','desc'):                sort_dir = 'asc'
+    return render_dir(rel, sort_by=sort_by, sort_dir=sort_dir)
 
-@app.route('/upload/', defaults={'rel': ''}, methods=['POST'])
-@app.route('/upload/<path:rel>', methods=['POST'])
+@app.route('/search')
+def search():
+    q         = request.args.get('q', '').strip()
+    base      = request.args.get('base', '')
+    recursive = bool(request.args.get('r'))
+    if not q:
+        return redirect(url_for('browse', rel=base))
+    results = search_files(q, base, recursive)
+    return render_dir(base, search_q=q, search_results=results,
+                      search_recursive=recursive)
+
+@app.route('/upload/', defaults={'rel': ''}, methods=['GET', 'POST'])
+@app.route('/upload/<path:rel>', methods=['GET', 'POST'])
 def upload(rel):
+    if request.method == 'GET':
+        return redirect(url_for('browse', rel=rel))
     abs_dir = safe_path(rel)
     os.makedirs(abs_dir, exist_ok=True)
     files = request.files.getlist('file')
@@ -304,18 +428,21 @@ def upload(rel):
     for f in files:
         if f.filename:
             name = secure_filename(f.filename)
-            f.save(os.path.join(abs_dir, name))
-            saved.append(name)
+            if name:
+                f.save(os.path.join(abs_dir, name))
+                saved.append(name)
     msg = f'uploaded: {", ".join(saved)}' if saved else 'nothing uploaded'
     return render_dir(rel, msg, bool(saved))
 
-@app.route('/mkdir/', defaults={'rel': ''}, methods=['POST'])
-@app.route('/mkdir/<path:rel>', methods=['POST'])
+@app.route('/mkdir/', defaults={'rel': ''}, methods=['GET', 'POST'])
+@app.route('/mkdir/<path:rel>', methods=['GET', 'POST'])
 def mkdir(rel):
+    if request.method == 'GET':
+        return redirect(url_for('browse', rel=rel))
     dirname = request.form.get('dirname', '').strip()
     if not dirname:
         return render_dir(rel, 'folder name required', False)
-    name = secure_filename(dirname)
+    name   = secure_filename(dirname)
     target = safe_path(os.path.join(rel, name))
     os.makedirs(target, exist_ok=True)
     return render_dir(rel, f'created: {name}')
@@ -323,22 +450,37 @@ def mkdir(rel):
 @app.route('/dl/<path:rel>')
 def download(rel):
     abs_path = safe_path(rel)
-    if not os.path.isfile(abs_path):
-        abort(404)
+    if not os.path.isfile(abs_path): abort(404)
     return send_file(abs_path, as_attachment=True,
                      download_name=os.path.basename(abs_path))
 
 @app.route('/open/<path:rel>')
 def open_file(rel):
     abs_path = safe_path(rel)
-    if not os.path.isfile(abs_path):
-        abort(404)
+    if not os.path.isfile(abs_path): abort(404)
     mime, _ = mimetypes.guess_type(abs_path)
     return send_file(abs_path, mimetype=mime or 'application/octet-stream')
 
-@app.route('/delete/<path:rel>', methods=['POST'])
+@app.route('/show/<path:rel>')
+def show_file(rel):
+    abs_path = safe_path(rel)
+    if not os.path.isfile(abs_path): abort(404)
+    try:
+        with open(abs_path, 'r', encoding='utf-8', errors='replace') as fh:
+            content = fh.read(512 * 1024)  # cap at 512 KB
+    except Exception:
+        abort(500)
+    parts  = [p for p in rel.split('/') if p]
+    parent = '/'.join(parts[:-1])
+    return render_template_string(
+        SHOW_TEMPLATE,
+        name=os.path.basename(abs_path),
+        rel=rel, parent=parent,
+        content=content,
+    )
+
+@app.route('/delete/<path:rel>', methods=['GET', 'POST'])
 def delete(rel):
-    import shutil
     abs_path = safe_path(rel)
     if os.path.isdir(abs_path):
         shutil.rmtree(abs_path)
@@ -357,5 +499,5 @@ if __name__ == '__main__':
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=5050)
     args = parser.parse_args()
-    print(f'[drive] serving ~/files on http://{args.host}:{args.port}')
+    print(f'[drivey] serving ~/files on http://{args.host}:{args.port}')
     app.run(host=args.host, port=args.port, debug=False)
